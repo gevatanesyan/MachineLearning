@@ -1,0 +1,305 @@
+---
+Authors: "Gevorg Atanesyan"
+title: "Copart Data Price Prediction"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = F)
+knitr::opts_chunk$set(warning =  FALSE)
+
+cars<-read.csv("cars.csv")
+packages <- c("ggplot2","dplyr","ggcorrplot","car","randomForest", 
+              "rpart","data.table","rpart.plot","caret",
+              "tidyverse","rattle", "FNN", "lindia","lmtest", "devtools", "gbm")
+lapply(packages,library,character.only=TRUE)
+```
+
+
+
+
+**Introduction	**
+
+During the past years it was very popular among citizens of low income countries (especially armenians) to buy salvage cars from the different car auctions. The problem is that many people spend a lot of time on auctions but end up without buying any car, because of the final price. Hence, we decided to use various models to predict the car’s final price based on its features. It will help people to save their time and focus on the cars that have a high probability of being bought with the expected price. Data scraping was done from two websites: https://www.copart.com/ and https://autoastat.com/ . Copart provides apriori data on future car lots, but after the lot is closed the website does not show the final bid. Using the car identification number (VIN) final bid price was scraped from Autoastat using Python scraping tools (Beautiful Soup). The data consists of lots from the summer 2019. Taking into consideration relevant interests among most buyer groups two restrictions are made in the process of collecting data: the production year of the cars is limited from 2010 to 2017 and only vehicles which start under its own operation are selected (run and drive type). Our dataset contains 4027 observations and 12 variables such as car price, year of production, make, body style, color, odometer, estimated retail value, repair cost,  engine, drive,  cylinders and status.
+
+
+
+**Data cleaning**
+
+Below we rename our variables, also we do not need to include VIN and Detail in our analysis. Firstly, Model Group is divided into two parts, first part is the main part, so next we drop second part.
+```{r cars}
+setnames(cars,old=c("Model.Group","Body.Style", "Damage.Description", "Est..Retail.Value", "Repair.cost", "Sale.Status"),new=c("Model","Body", "Damage", "Retail_value", "Repair_cost", "Status"))
+cars <-separate(data = cars, col = Model, into = c("Model", "Model_Comment"), sep = " ")
+cars<-select(cars, -c(VIN,Model.Detail,Model_Comment))
+
+```
+
+We start with reapir cost variable, it has a lot of zero (which are assumed to be missing values). As the data is of salvage cars and a car to be  classified as a salvage it needs to be wrecked at least by 75%. So, missing values are recovered using mean percent ratio between retail value and repair cost (skipping missing values).
+```{r}
+mean_repair<-mean(cars$Repair_cost[cars$Repair_cost!=0])
+mean_retail<-mean(cars$Retail_value[cars$Repair_cost!=0])
+ratio<-round(mean_repair/mean_retail*100)
+
+cars$Repair_cost<-ifelse(cars$Repair_cost==0,
+                         cars$Retail_value*ratio/100, 
+                         cars$Repair_cost)
+
+```
+Next we change the levels of body style. Due to similarity and rareness in dataset styles "4DR EXT", "4DR SPOR" and "CLUB CAB" are incorporated into one group named "JEEP 4D". Analogically, "CONVERTI", "COUPE" and "SPORTS V" in the group "SPORT". Remaining and most prevalent item "SEDAN 4D" is left alone. Overall, we have factor variable with three levels.
+
+```{r}
+cars$Body<-as.character(cars$Body)
+
+
+cars$Body<-ifelse(cars$Body=="4DR EXT"|cars$Body=="4DR SPOR"|cars$Body=="CLUB CAB", "JEEP 4D", cars$Body)
+cars$Body<-ifelse(cars$Body=="CONVERTI"|cars$Body=="COUPE"|cars$Body=="SPORTS V", "SPORT", cars$Body)
+
+addmargins(table(cars$Body))
+```
+
+
+First, lets create universal function for filtering data.
+```{r}
+price_filter<-function(x){
+  table<-cars %>% 
+  group_by_at(x) %>% 
+  summarise(
+    Freq=n(),
+    mean_p = mean(Price),
+    mean_v = mean(Retail_value))
+  table<- table %>%
+    mutate(v_p_ratio=round((mean_p/mean_v)*100,1))
+  return (table)}
+```
+
+In the next step we deal with variable color. In the original dataset it has 19 unique options, but it is too many for categorical variable with this importance. Filtering by color and comparing price ratio between final bid and retail value, we separate three groups: white (which price significantly outperforms other colors'), popular (black, red, gray, blue, charcoal, silver) and rare (orange, yellow, green, etc).
+```{r}
+price_filter(6)
+
+cars$Color<-as.character(cars$Color)
+
+cars$Color<-ifelse(cars$Color=="BLACK"|cars$Color=="BLUE"|
+                     cars$Color=="CHARCOAL"| cars$Color=="GRAY"|
+                     cars$Color=="RED"|cars$Color=="SILVER", "POPULAR",
+                   cars$Color)
+cars$Color<-ifelse(cars$Color!="WHITE" & cars$Color!="POPULAR",
+                   "RARE", cars$Color)
+price_filter(6)
+```
+
+Finally, we change the levels of Damage. Here we see that significant factor of price decrease is whether the damage is done from front or not. So we divide damage into two parts: Front (ALL OVER, Front and ROLLOVER) and Rear_Side (remaining).
+```{r}
+cars$Damage<-as.character(cars$Damage)
+cars$Damage<-ifelse(cars$Damage=="ALL OVER"|cars$Damage=="Front"|
+                     cars$Damage=="ROLLOVER", "Front", "Rear_Side")
+price_filter(7)
+```
+
+Next combining "4x4" and "All" into one group "All" and saving recent changed  variables as factor.
+
+```{r}
+cars <- within(cars, Drive[Drive=="All"|Drive=="4x4"] <- "All")
+factors <- c('Color','Drive','Body', 'Damage','Model', 'Make', 'Status')
+cars[factors]= data.frame(apply(cars[factors], 2, as.factor))
+str(cars)
+```
+
+
+
+
+**Data Visualization**
+
+In the beggining lets show correlation plot between numeric variables of data.
+```{r}
+nums <- select_if(cars, is.numeric)
+cornums <-cor(nums)      
+ggcorrplot(cornums,show.legend = T, lab = T, title = "Correlation Plot")
+```
+
+From this table we conclude that the highest correlated variable with price (positively)  is retail_value (0.89). On the other hand, odometer has negative impact on price; coefficient is -0.35. Overall, price is correlated with all numerical variables.
+
+
+```{r}
+ggplot(cars, aes(x=Price))+geom_histogram(bins = 30, fill="Blue", alpha=0.8, )+ggtitle("Price Distribution")
+```
+
+
+The plot is right-skewed, most of car prices are below 15000$, majority of which are in range [3000, 5000].  
+
+
+
+```{r}
+ggplot(cars,aes(x=`Make`))+ geom_bar(fill="Blue", alpha= 0.5)+ labs(x="Brand Name", y="Frequency", title="Frequency Table for Brands")+
+  theme_classic()
+```
+
+More prevalent car brands are Honda, Nissan and Toyota. Luxury car brands such as Audi and Porsche are very rare.
+
+```{r}
+
+make_table<-data.frame(price_filter(3))
+
+ggplot(make_table, aes(x=Make, y=v_p_ratio))+
+  geom_point(color="Blue", size=3)+
+  labs(x="Brand Name", y="Percent Ratio", title="Percent ratio of Retail Value and Final Price for different Brands")
+```
+
+As the most significant predictor is retail value, so it os logical to have price ratio between final bid and retail value. Here we see that Lexus and Porsche have the highest values above 40 %. The least ratio has Mazda less than 20 %. On average, ratio is around 30%. 
+```{r}
+
+ggplot(cars,aes(x=Make,y=Price))+ geom_boxplot(fill="Blue", alpha= 0.5)+ theme_classic()+ggtitle(" Make vs Price")
+
+
+```
+
+
+Among the all brands  Porsche seem to be highly priced. Luxury brands like Lexus, BMW, Mercedes and Audi have similar price range, the rest seem to have similar range price.
+
+
+
+
+
+**Prediction with Linear Regression**
+
+In this step we split our data into test and train parts. We trained 80% of the data and tested it on the 20% of the remained data. As our goal is to predict the price of the car, we took "Price" variable as y and constructed our model  Year, Odometer, Color, Repair_cost, Retail_value, Engine, Status, Make, Damage and Drive which as explanatory variables. 
+
+```{r}
+set.seed(1)
+index<-createDataPartition(cars$Price, p=.8, list=FALSE)
+train<-cars[index, ]
+test<-cars[-index, ]
+linear <- lm(Price~Year+Odometer+Color+Repair_cost+Retail_value+Engine+Status+Make+Damage+Drive,data = train)
+
+pred <- predict(linear, newdata=test)
+RMSE(test$Price,pred)
+summary(linear)
+```
+
+As the p value is very small, so we reject the null hypothesis and conclude that overall model significant. Main metrics of model evaluation R-square is  0.8157 and RMSE = 2222.688. 
+
+```{r}
+bptest(linear)
+vif(linear)
+```
+
+VIF is not large (maybe exception is Repair_value, which is logical as some repair_cost values are adjusted with the latter), thus there is no multicollinearity and the model does not have problems estimating the coefficient. On the other hand, running Breusch-Pagan heteroskedasticity test, we get small p-value, which is an indicator heteroscedasticity. 
+
+
+
+**Random forest**
+
+Here we run Random Forest model with different mtry values.
+```{r}
+set.seed(1)
+RMSE_Forest <- c()
+Mtry <- seq(1,10,1)
+for (i in Mtry){
+  forest <-  randomForest(Price~Year+Odometer+Repair_cost+Retail_value+Engine+Status+Make+Damage,data=train, ntree=25, do.trace=F,mtry=i)
+  forpred <- predict(forest,test,type="response")
+  RMSE_Forest[i]= RMSE(forpred,test$Price)
+}
+
+df <- data.frame(RMSE_Forest, Mtry)
+df
+ggplot(df ,aes(x=Mtry,y=RMSE_Forest))+ geom_point()+geom_line()+ggtitle("For each Mtry's RMSE")+xlab("Mtry")+ylab("RMSE")
+```
+
+The result shows that minimum RMSE is 2336.589, which is achieved when Mtry is equal to 9. Comparing with linear regression model, it has near the same RMSE score. 
+
+
+**KNN Regression**
+
+First, we take the numeric variables of the dataset because KNN regression takes only numeric variables. Moreover, for KNN regression data should be normalized around the mean. For example, there is more variance for  odometer  than engine size that iss why we should scale the data. In our example we want to predict Car price based on features Retail_value, Year, Odometer, Engine, etc.
+
+
+So how to choose K in our example we write a loop which calculates RMSE for each K. The lower RMSE better the model.
+```{r}
+set.seed(1)
+numeric_variables <- c(1:2,8:11,13)
+
+
+train_knn<-train[, numeric_variables]
+test_knn<-test[, numeric_variables]
+train_knn <- as.data.frame(lapply(train_knn, scale))
+test_knn <- as.data.frame(lapply(test_knn, scale))
+
+
+RMSE_KNN<-NULL
+for (i in 1:30){
+  knn<-knn.reg(train=train_knn[,-1],test=test_knn[,-1],
+                     y=train$Price,k=i)
+  RMSE_KNN[i]<-sqrt(mean((test$Price-knn$pred)^2))
+}
+df_knn<-data.frame(k=1:30, RMSE=RMSE_KNN)
+ggplot(data=df_knn, aes(x=k, y=RMSE))+
+  geom_point(color="blue")+geom_line()+
+  labs(y="RMSE", x="k", title="RMSE for different k's")
+df_knn
+```
+
+The best result as achieved in the case of k=2, minimum RMSE Score = 2552.146. As our categorical variables have significant impact on price, it is not surprise that the result of KNN regression is not the best.
+
+
+
+**Gradient Boosting**
+Gradient Boosting tries to find out the next best possible model, when combined with previous models and then minimizes overall prediction error. The main idea is to target the next model in order to minimize the error. In our example Gradient model generates 10000 trees , the shrinkage is 0.2 and interaction depth total splits are 4.
+```{r}
+
+set.seed(1)
+modelgbm <- gbm(Price~Year+Odometer+Repair_cost+Retail_value+Engine+Status+Make+Damage,data=train, n.trees=1000, shrinkage = 0.2, interaction.depth =  4, distribution = "gaussian")
+
+summary(modelgbm)
+
+plot(modelgbm,i="Year") 
+
+plot(modelgbm,i="Retail_value") 
+
+predictgbm <- predict(modelgbm,test, n.trees= 1000 , type="response")
+RMSE(predictgbm,test$Price)
+
+```
+
+Summary(modelGbm) gives us variable importance plots. We can see Retail_value, Make, Repair cost are important variables.
+The above plots show the relation between the variable in the x axis and the maping fuction in the y axis.
+In plot(modlegbm,i="Year") we can see that response variable is positively corelated with Year variable. In plot(modlegbm,i="Retail_value")  we see Retail_value is also positively correlated with price. Finally, we can make predictions on the test set and calculate RMSE which is 3330, worse than in other model.
+
+
+**Conclusion**
+In this paper we tried to predict copart auction bid prices taking explanatory variables Retail_value, Repair_cost, Year, Odometer, etc. We constructed different models for this purpose; linear regression, random forest, KNN regression and Gradient Boosting. Linear regression and Random forest give identical results (the former is a bit more accurate). On the other hand, KNN and Gradient Boosting were not as good as we anticipated. Comparing KNN and linear regression, the decrease in accuracy is mainly due to filtering only numerical variables (KNN demands it). Unfortunately, we can not interpret the reasons why Gradient Boosting failed. Saying the latter, we do not try to diminish the importance and robustness of our project, as linear regression and random forest models solve our problem.
+
+
+
+**Appendix**
+
+Data Visualization
+```{r}
+ggplot(cars,aes(x=Body))+ geom_bar(fill="Blue", alpha= 0.5)+ theme_classic()+ggtitle("1. Car's Body Histogram")
+
+ggplot(cars,aes(x=Drive))+ geom_bar(fill="Blue", alpha= 0.5)+ theme_classic()+ ggtitle("2. Car's Drive type Histogram")
+ggplot(cars,aes(x=Color,y=Price))+ geom_boxplot(fill="Blue", alpha= 0.5)+ theme_classic()+ggtitle("3. Color Vs Price")+xlab("Car Color")
+```
+Reagrding plots interpretation the following is true:
+
+1. Sedan 4D are the most in data.
+
+2. All wheel drives are more than others.
+
+3. White color seems to be higher priced than Rare and Popular colors.
+
+
+**Linear Regression**
+```{r}
+linear_full <- lm(Price~Year+Odometer+Repair_cost+Retail_value+Engine+Status+Make+Model+Damage,data = train)
+summary(linear_full)
+```
+
+This model provides us with higher Adjusted R square, but inlcusion of model group brings multicollinearity problem as well, looking at the summary there are NA coefficients.
+
+```{r}
+gg_diagnose(linear, plot.all=T)
+```
+
+
+The least but not the last just take a look at different plots of linear regression.
+
+
